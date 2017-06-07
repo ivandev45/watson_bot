@@ -1,77 +1,157 @@
 const res = 'resources';
 const defaultExt = '.jpg';
+const defaultAnswer = "Just let me look at your photo and I'l tell you how much does it looks like Shibu Ibu";
+const rejectAnswer = 'Wait, your pic is already on the server';
+const errorAnswer = 'Wrong format. Expected : ' + defaultExt;
+const users = res + '/u_users';
 const config = require('./Config');
 
 const telegramBot = require('node-telegram-bot-api');
 const watson = require('watson-developer-cloud');
 const https = require('https');
 const fs = require('fs');
+var Stream = require('stream').Transform;
 
+//config data
+//
 const token = config.telegramToken;
 const apiKey = config.watsonApiKey;
 const classifierId = config.classifierId;
+const version = config.version;
+const version_date = config.version_date;
 const getDownloadFileUri = config.downloadFileUri;
+//
+// create folder for cache and logs
+if (!fs.existsSync(res)){
+    fs.mkdirSync(res);
+}
+//
+console.log('Server started, bot is working...');
+//
 
+/*
+  *  creating Telegram Bot
+  *  polling mode : node app goes to Telegram server (every second)
+  *  and get new messages.
+* */
 const bot = new telegramBot(token, {polling: true});
 
-var visual_recognition = watson.visual_recognition({
+/*
+* watson visual recognition object
+* */
+const visual_recognition = watson.visual_recognition({
     api_key: apiKey,
-    version: 'v3',
-    version_date: '2016-05-20'
+    version: version,
+    version_date: version_date
 });
 
-var getParams = (descriptor) => {
+/**
+ * @private
+ * @param {String} descriptor
+ */
+
+let getParams = (descriptor) => {
     return new Promise((resolve) => {
        resolve({
+           // file from cache
            images_file: fs.createReadStream(descriptor),
-           classifier_ids : [classifierId]
+           // the only classifier used : custom classifier
+           classifier_ids : [classifierId],
+           // matching score > 0 (every)
+           threshold : 0
        });
     });
 };
 
-bot.on('message', async function (msg) {
-    let filePath = (await bot.getFile(msg.document.file_id)).file_path;
-    let downloadUri = getDownloadFileUri(token, filePath);
-    let descriptor = await saveImage(downloadUri, msg.from.id);
-    if (!descriptor) {
-        // wait, only 1 img at the moment for user.
-    }
-    else {
-        let params = await getParams(descriptor);
-        console.log(params);
-        visual_recognition.classify(params, (err, res) => {
-            if (err) throw err;
-            else {
-                console.log(JSON.stringify(res, null, 2));
-                bot.sendMessage(msg.from.id, JSON.stringify(res, null, 2));
-                //fs.unlinkSync(descriptor); // todo
-            }
-        });
-    }
-});
+/**
+ * @private
+ * @param {String} downloadUri
+ * @param {Number} userId
+ */
 
 function saveImage(downloadUri, userId) {
     return new Promise((resolve) => {
-        let uniqId = res + '/f_' + userId + defaultExt;
-        console.log(uniqId);
+        let name = 'f_' + userId + defaultExt;
+        let uniqId = res + '/' + name;
         fs.readdir(res, (err, files) => {
-            if (files.indexOf(uniqId) > -1) resolve(false);
+            if (files.indexOf(name) > -1) resolve(false);
             else {
-                let file = fs.createWriteStream(uniqId);
-                https.get(downloadUri, async (response) => {
-                    await response.pipe(file);
-                    resolve(uniqId);
-                });
+                https.request(downloadUri, (response) => {
+                    let data = new Stream();
+                    response.on('data', (chunk) => {
+                        data.push(chunk);
+                    });
+                    response.on('end', () => {
+                        fs.writeFile(uniqId, data.read(), () => {resolve(uniqId);});
+                    });
+                }).end();
             }
         });
     });
 }
 
-// successful test
-visual_recognition.classify({
-    images_file: fs.createReadStream('resources/f_274883283.jpg'),
-    classifier_ids : [classifierId]
-}, function(err, res) {
-    if (err) console.log(err);
-    else console.log(JSON.stringify(res, null, 2));
+/**
+ * @private
+ * @param {String} text
+ */
+
+var log = (text) => {
+    return new Promise(function(resolve, reject) {
+        fs.appendFile(users, text+'\n', 'utf-8', function(err) {
+            if (err) reject(err);
+            else resolve();
+        });
+    })
+};
+
+// any kind of text messages
+bot.onText(/.+/, (msg) => {
+    bot.sendMessage(msg.from.id, defaultAnswer);
 });
+
+//
+bot.on('message', async function (msg) {
+
+    await log(new Date() + ' ::' + JSON.stringify(msg.from));
+
+    let from = msg.from.id;
+    let filePath = (msg.document) ? //
+        // case : attachment
+        (await bot.getFile(msg.document.file_id)).file_path : (msg.photo) ?
+        // case : media
+        (await bot.getFile(msg.photo[msg.photo.length-1].file_id)).file_path :
+        // case : other message type
+        null;
+    // if there is no photo in message - exit
+    if (!filePath) return;
+    // if file has incorrect format // todo (weak checking)
+    if (!filePath.endsWith(defaultExt)) {
+        bot.sendMessage(from, errorAnswer);
+        return;
+    }
+    let downloadUri = getDownloadFileUri(token, filePath);
+    // download file from server
+    let descriptor = await saveImage(downloadUri, from);
+    // if photo from certain user is already on server - reject request
+    if (!descriptor) {
+        bot.sendMessage(from, rejectAnswer);
+    }
+    else {
+        // get data about matching
+        visual_recognition.classify(await getParams(descriptor), (err, res) => {
+            if (err) throw err;
+            else {
+                // 1 image, 1 classifier
+                res.images[0].classifiers[0].classes.forEach((e) => {
+                    // print matching score
+                    bot.sendMessage(from, e.class + ' : ' + (e.score*100).toFixed(2) + '%');
+                });
+                // delete file
+                fs.unlinkSync(descriptor);
+            }
+        });
+    }
+});
+
+
+
